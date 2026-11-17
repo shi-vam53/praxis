@@ -52,15 +52,24 @@ def generate_certificate_pdf(
     c.setFillColor(colors.HexColor("#334155"))
     c.drawCentredString(width / 2, height - 195, "This official credential certifies that")
 
-    # Learner Name
-    c.setFont("Helvetica-Bold", 26)
+    # Learner Name with dynamic text scaling to prevent canvas overflow
+    max_text_width = width - 180  # Allow safe margin on both sides
+    font_size = 26
+    while font_size > 11:
+        text_w = c.stringWidth(learner_name, "Helvetica-Bold", font_size)
+        if text_w <= max_text_width:
+            break
+        font_size -= 1
+
+    c.setFont("Helvetica-Bold", font_size)
     c.setFillColor(colors.HexColor("#0f172a"))
     c.drawCentredString(width / 2, height - 240, learner_name)
 
-    # Divider line under name
+    # Divider line under name, sized proportionally to name width
+    divider_half_w = max(180, min(text_w / 2 + 25, (width - 120) / 2))
     c.setStrokeColor(colors.HexColor("#cbd5e1"))
     c.setLineWidth(1)
-    c.line(width / 2 - 180, height - 250, width / 2 + 180, height - 250)
+    c.line(width / 2 - divider_half_w, height - 250, width / 2 + divider_half_w, height - 250)
 
     # Body statement
     c.setFont("Helvetica", 11)

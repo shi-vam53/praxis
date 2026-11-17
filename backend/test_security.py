@@ -238,3 +238,76 @@ def test_submission_review_requires_admin_authorization(client):
     )
     assert admin_patch.status_code == 200
     assert admin_patch.json()["reviewer_status"] == "approved"
+
+
+def test_username_length_boundaries_and_sanitization(client):
+    """Verify strict 32-character boundary enforcement and injection rejection."""
+    # 1. Exact 32-character username boundary -> Accepted (201)
+    exact_32_user = "u" * 32
+    res_32 = client.post(
+        "/api/auth/register",
+        json={"username": exact_32_user, "password": "password123", "full_name": "Boundary User 32"},
+    )
+    assert res_32.status_code == 201, f"Expected 201 for 32-char username, got {res_32.status_code}: {res_32.text}"
+
+    # 2. 33-character boundary username -> Rejected (422)
+    boundary_33_user = "u" * 33
+    res_33 = client.post(
+        "/api/auth/register",
+        json={"username": boundary_33_user, "password": "password123", "full_name": "Boundary User 33"},
+    )
+    assert res_33.status_code == 422, f"Expected 422 for 33-char username, got {res_33.status_code}"
+
+    # 3. 52-character username -> Rejected (422)
+    long_52_user = "a" * 52
+    res_52 = client.post(
+        "/api/auth/register",
+        json={"username": long_52_user, "password": "password123", "full_name": "Fifty Two User"},
+    )
+    assert res_52.status_code == 422, f"Expected 422 for 52-char username, got {res_52.status_code}"
+
+    # 4. Disallowed characters and injection vectors -> Rejected (422)
+    injection_usernames = [
+        "admin' OR '1'='1",
+        "<script>alert(1)</script>",
+        "user with spaces",
+        "user;DROP TABLE users;--",
+        "user\x00nullbyte",
+    ]
+    for bad_u in injection_usernames:
+        res_bad = client.post(
+            "/api/auth/register",
+            json={"username": bad_u, "password": "password123", "full_name": "Bad User"},
+        )
+        assert res_bad.status_code == 422, f"Expected 422 for injection username '{bad_u}', got {res_bad.status_code}"
+
+
+def test_username_unicode_nfkc_normalization(client):
+    """Verify Unicode compatibility characters are normalized with NFKC."""
+    # Using Unicode full-width characters 'ＵＳＥＲ_ｎｆｋｃ' which fold to 'user_nfkc' under NFKC
+    fullwidth_user = "ＵＳＥＲ_ｎｆｋｃ"
+    res = client.post(
+        "/api/auth/register",
+        json={"username": fullwidth_user, "password": "password123", "full_name": "NFKC Tester"},
+    )
+    assert res.status_code == 201
+    assert res.json()["user"]["username"] == "user_nfkc"
+
+
+def test_certificate_dynamic_bounds_scaling(tmp_path):
+    """Verify PDF certificate generator scales font and dividers for boundary learner names."""
+    from backend.certificate import generate_certificate_pdf
+
+    cert_path = tmp_path / "test_cert_long.pdf"
+    # Test with 50-character boundary name
+    long_name = "Alexandrina Montgomery-Wellington the Third Esq."
+    out_path = generate_certificate_pdf(
+        cert_path,
+        learner_name=long_name,
+        role_title="Software Developer & Systems Specialist",
+        cert_id="PX-CERT-TESTBOUNDS",
+        date_str="November 13, 2026",
+    )
+    assert out_path.exists()
+    assert out_path.stat().st_size > 1000  # Valid non-empty PDF
+

@@ -20,13 +20,14 @@ import re
 import secrets
 import sqlite3
 from typing import Any
+import unicodedata
 from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .generate_handbook import build_handbook_pdf
 from .generate_role_handbooks import build_role_handbook_pdf, ROLE_CONFIGS
@@ -116,14 +117,28 @@ def _supabase_sync_progress(user_id: str, problem_id: str, status: str, score: i
 # ==============================================================================
 
 class RegisterRequest(BaseModel):
-    username: str = Field(min_length=3, max_length=100)
+    username: str = Field(min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_\-\.@+]{3,32}$")
     password: str = Field(min_length=6, max_length=100)
-    full_name: str | None = Field(default=None, max_length=100)
+    full_name: str | None = Field(default=None, max_length=50)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def normalize_username(cls, v: Any) -> str:
+        if isinstance(v, str):
+            return unicodedata.normalize("NFKC", v.strip())
+        return v
 
 
 class LoginRequest(BaseModel):
-    username: str = Field(min_length=1, max_length=100)
+    username: str = Field(min_length=1, max_length=32)
     password: str = Field(min_length=1, max_length=100)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def normalize_username(cls, v: Any) -> str:
+        if isinstance(v, str):
+            return unicodedata.normalize("NFKC", v.strip())
+        return v
 
 
 class SelectRoleRequest(BaseModel):
@@ -329,9 +344,12 @@ class SubmissionStore:
             connection.close()
 
     def create_user(self, username: str, password: str, full_name: str | None = None) -> tuple[dict[str, Any], str]:
-        uname = username.strip().casefold()
-        if not uname or len(uname) < 3:
-            raise ValueError("Email or username must be at least 3 characters")
+        norm = unicodedata.normalize("NFKC", username.strip()) if username else ""
+        uname = norm.casefold()
+        if not uname or len(uname) < 3 or len(uname) > 32:
+            raise ValueError("Email or username must be between 3 and 32 characters")
+        if not re.match(r"^[a-zA-Z0-9_\-\.@+]{3,32}$", uname):
+            raise ValueError("Username contains invalid characters. Use alphanumeric, dot, dash, plus, or underscore.")
         if len(password) < 6:
             raise ValueError("Password must be at least 6 characters")
 
@@ -382,7 +400,8 @@ class SubmissionStore:
         return user, token
 
     def authenticate_user(self, username: str, password: str) -> tuple[dict[str, Any], str]:
-        uname = username.strip().casefold()
+        norm = unicodedata.normalize("NFKC", username.strip()) if username else ""
+        uname = norm.casefold()
         connection = self._connect()
         try:
             row = connection.execute(
