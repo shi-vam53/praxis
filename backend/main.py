@@ -59,11 +59,13 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://awaxsbdimvatdlawkzai.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_N8cJzBJvsdDceCTs-Bq3ng_XPD_3nET")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 
 def _supabase_sync_user(user_dict: dict[str, Any]) -> None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
     try:
         import httpx
         headers = {
@@ -82,6 +84,9 @@ def _supabase_sync_user(user_dict: dict[str, Any]) -> None:
             "quiz_score": user_dict.get("quiz_score", 0),
             "created_at": user_dict.get("created_at"),
         }
+        # Explicitly ensure password hashes are NEVER synced to external databases
+        payload.pop("password_hash", None)
+        payload.pop("password_salt", None)
         with httpx.Client(timeout=2.0) as client:
             client.post(f"{SUPABASE_URL}/rest/v1/users", json=payload, headers=headers)
     except Exception:
@@ -89,6 +94,8 @@ def _supabase_sync_user(user_dict: dict[str, Any]) -> None:
 
 
 def _supabase_sync_progress(user_id: str, problem_id: str, status: str, score: int, solution: str, feedback: str) -> None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
     try:
         import httpx
         headers = {
@@ -274,8 +281,15 @@ class SubmissionStore:
                 )
                 """
             )
+            try:
+                connection.execute("ALTER TABLE submissions ADD COLUMN user_id TEXT")
+            except Exception:
+                pass
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_submissions_mission_id ON submissions(mission_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_submissions_user_id ON submissions(user_id)"
             )
             connection.execute(
                 """
@@ -326,8 +340,15 @@ class SubmissionStore:
             except Exception:
                 pass
 
-            # Pre-seed or ensure platform administrator: shivam
-            admin_initial_pwd = os.environ.get("ADMIN_INITIAL_PASSWORD", "shivam")
+            # Pre-seed or ensure platform administrator securely
+            admin_initial_pwd = os.environ.get("ADMIN_INITIAL_PASSWORD")
+            if not admin_initial_pwd:
+                if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TEST_MODE") == "1":
+                    admin_initial_pwd = "shivam"
+                else:
+                    admin_initial_pwd = secrets.token_urlsafe(18)
+                    print(f"[SECURITY] Generated initial administrator password for 'shivam': {admin_initial_pwd}")
+
             admin_pwd_hash, admin_pwd_salt = _hash_password(admin_initial_pwd)
             now = _now_utc()
             row_admin = connection.execute("SELECT user_id FROM users WHERE username = 'shivam'").fetchone()
@@ -335,7 +356,7 @@ class SubmissionStore:
                 connection.execute(
                     """
                     INSERT INTO users (user_id, username, full_name, password_hash, password_salt, role, role_locked, quiz_passed, quiz_score, is_admin, created_at)
-                    VALUES (?, 'shivam', 'shivam', ?, ?, 'Platform Administrator', 1, 1, 100, 1, ?)
+                    VALUES (?, 'shivam', 'Platform Administrator', ?, ?, 'Platform Administrator', 1, 1, 100, 1, ?)
                     """,
                     (str(uuid4()), admin_pwd_hash, admin_pwd_salt, now),
                 )
@@ -392,7 +413,7 @@ class SubmissionStore:
             "role_locked": False,
             "quiz_passed": False,
             "quiz_score": 0,
-            "is_admin": (uname == "shivam"),
+            "is_admin": False,
             "created_at": now,
         }
         self.sync_users_to_ledger()
@@ -489,7 +510,8 @@ class SubmissionStore:
         connection = self._connect()
         try:
             cursor = connection.execute(
-                f"DELETE FROM sessions WHERE datetime(created_at) < datetime('now', '-{max_age_days} days')"
+                "DELETE FROM sessions WHERE datetime(created_at) < datetime('now', ?)",
+                (f"-{int(max_age_days)} days",),
             )
             connection.commit()
             return cursor.rowcount
@@ -670,12 +692,13 @@ class SubmissionStore:
         try:
             connection.execute(
                 """
-                INSERT INTO submissions (submission_id, mission_id, answers_json, result_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO submissions (submission_id, mission_id, user_id, answers_json, result_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     submission["submission_id"],
                     submission["mission_id"],
+                    submission.get("user_id"),
                     json.dumps(submission["answers"], ensure_ascii=False),
                     json.dumps(submission, ensure_ascii=False),
                     submission["created_at"],
@@ -715,6 +738,23 @@ class SubmissionStore:
             connection.close()
         return [json.loads(row["result_json"]) for row in rows]
 
+    def list_by_user(self, user_id: str, limit: int = 50, mission_id: str | None = None) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            if mission_id:
+                rows = connection.execute(
+                    "SELECT result_json FROM submissions WHERE user_id = ? AND mission_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (user_id, mission_id, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT result_json FROM submissions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (user_id, limit),
+                ).fetchall()
+        finally:
+            connection.close()
+        return [json.loads(row["result_json"]) for row in rows]
+
     def update_review(self, submission_id: str, reviewer_status: str, reviewer_notes: str) -> dict[str, Any] | None:
         sub = self.get(submission_id)
         if sub is None:
@@ -744,15 +784,17 @@ def _submission_fields(mission: dict[str, Any]) -> list[str]:
     return []
 
 
-def _has_answer_content(value: Any) -> bool:
+def _has_answer_content(value: Any, depth: int = 0) -> bool:
+    if depth > 3:
+        return False
     if value is None:
         return False
     if isinstance(value, str):
         return bool(value.strip())
     if isinstance(value, dict):
-        return any(_has_answer_content(item) for item in value.values())
+        return any(_has_answer_content(item, depth + 1) for item in value.values())
     if isinstance(value, (list, tuple)):
-        return any(_has_answer_content(item) for item in value)
+        return any(_has_answer_content(item, depth + 1) for item in value)
     return True
 
 
@@ -830,13 +872,21 @@ def create_app(
             "img-src 'self' data: https:; "
             "font-src 'self' data:; "
             "connect-src 'self' https://api.groq.com https://*.supabase.co https://*.github.io; "
-            "frame-ancestors 'self';"
+            "object-src 'none'; "
+            "base-uri 'none'; "
+            "frame-ancestors 'none';"
         )
         return response
 
     application.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|.*\.e2b\.app|shi-vam53\.github\.io)(:\d+)?",
+        allow_origins=[
+            "https://shi-vam53.github.io",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://0.0.0.0:8000",
+        ],
+        allow_origin_regex=r"https://[a-zA-Z0-9-]+\.e2b\.app",
         allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
         allow_headers=["*"],
     )
@@ -870,13 +920,11 @@ def create_app(
     @application.get("/api/admin/users/csv", tags=["admin"])
     def get_registered_users_csv(
         authorization: str | None = Header(default=None),
-        admin_key: str | None = Query(default=None),
     ):
         from fastapi.responses import Response
-        user = _resolve_user(authorization) if authorization else None
-        if not user or not user.get("is_admin"):
-            if admin_key != os.environ.get("ADMIN_SECRET_KEY", "praxis-admin-secret-2026"):
-                raise HTTPException(status_code=403, detail="Administrator privileges required.")
+        user = _require_user(authorization)
+        if not user.get("is_admin"):
+            raise HTTPException(status_code=403, detail="Administrator privileges required.")
         csv_text = store.export_users_csv()
         return Response(
             content=csv_text,
@@ -887,12 +935,10 @@ def create_app(
     @application.get("/api/admin/google-sheet", tags=["admin"])
     def get_google_sheet_info(
         authorization: str | None = Header(default=None),
-        admin_key: str | None = Query(default=None),
     ) -> dict[str, Any]:
-        user = _resolve_user(authorization) if authorization else None
-        if not user or not user.get("is_admin"):
-            if admin_key != os.environ.get("ADMIN_SECRET_KEY", "praxis-admin-secret-2026"):
-                raise HTTPException(status_code=403, detail="Administrator privileges required.")
+        user = _require_user(authorization)
+        if not user.get("is_admin"):
+            raise HTTPException(status_code=403, detail="Administrator privileges required.")
         csv_text = store.export_users_csv()
         lines = [line for line in csv_text.strip().split("\n") if line.strip()]
         total_users = max(0, len(lines) - 1)
@@ -907,32 +953,13 @@ def create_app(
     def get_leaderboard() -> list[dict[str, Any]]:
         return store.get_leaderboard_data()
 
-    @application.post("/api/admin/login", tags=["admin"])
-    def admin_login(payload: LoginRequest, request: Request) -> dict[str, Any]:
-        client_ip = request.client.host if request.client else "127.0.0.1"
-        _check_rate_limit(client_ip)
-        uname = payload.username.strip().casefold()
-        try:
-            user, token = store.authenticate_user(uname, payload.password)
-            if not user.get("is_admin"):
-                raise HTTPException(
-                    status_code=401,
-                    detail=f"Access restricted. Invalid administrator credentials for '{uname}'."
-                )
-            user["is_admin"] = True
-            return {"user": user, "token": token, "is_admin": True, "message": "Admin session unlocked."}
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=401,
-                detail=f"Access restricted. Invalid administrator credentials for '{uname}'."
-            ) from exc
-
     # --------------------------------------------------------------------------
     # AUTHENTICATION & ROLE LOCKING
     # --------------------------------------------------------------------------
     _AUTH_RATE_LIMITS: dict[str, list[float]] = {}
+    _ACCOUNT_FAILED_ATTEMPTS: dict[str, list[float]] = {}
 
-    def _check_rate_limit(client_ip: str, max_requests: int = 1000, window_secs: float = 60.0) -> None:
+    def _check_rate_limit(client_ip: str, max_requests: int = 25, window_secs: float = 60.0) -> None:
         now = datetime.now(timezone.utc).timestamp()
         timestamps = _AUTH_RATE_LIMITS.setdefault(client_ip, [])
         _AUTH_RATE_LIMITS[client_ip] = [t for t in timestamps if now - t < window_secs]
@@ -943,6 +970,51 @@ def create_app(
                 headers={"Retry-After": "60"},
             )
         _AUTH_RATE_LIMITS[client_ip].append(now)
+
+    def _check_account_lockout(username: str, max_failures: int = 5, lock_secs: float = 300.0) -> None:
+        now = datetime.now(timezone.utc).timestamp()
+        uname = username.strip().casefold()
+        timestamps = _ACCOUNT_FAILED_ATTEMPTS.setdefault(uname, [])
+        _ACCOUNT_FAILED_ATTEMPTS[uname] = [t for t in timestamps if now - t < lock_secs]
+        if len(_ACCOUNT_FAILED_ATTEMPTS[uname]) >= max_failures:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many consecutive failed login attempts for this account. Locked for 5 minutes.",
+                headers={"Retry-After": "300"},
+            )
+
+    def _record_failed_attempt(username: str) -> None:
+        now = datetime.now(timezone.utc).timestamp()
+        uname = username.strip().casefold()
+        _ACCOUNT_FAILED_ATTEMPTS.setdefault(uname, []).append(now)
+
+    def _clear_failed_attempts(username: str) -> None:
+        uname = username.strip().casefold()
+        _ACCOUNT_FAILED_ATTEMPTS.pop(uname, None)
+
+    @application.post("/api/admin/login", tags=["admin"])
+    def admin_login(payload: LoginRequest, request: Request) -> dict[str, Any]:
+        client_ip = request.client.host if request.client else "127.0.0.1"
+        _check_rate_limit(client_ip)
+        uname = payload.username.strip().casefold()
+        _check_account_lockout(uname)
+        try:
+            user, token = store.authenticate_user(uname, payload.password)
+            if not user.get("is_admin"):
+                _record_failed_attempt(uname)
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Access restricted. Invalid administrator credentials for '{uname}'."
+                )
+            _clear_failed_attempts(uname)
+            user["is_admin"] = True
+            return {"user": user, "token": token, "is_admin": True, "message": "Admin session unlocked."}
+        except ValueError as exc:
+            _record_failed_attempt(uname)
+            raise HTTPException(
+                status_code=401,
+                detail=f"Access restricted. Invalid administrator credentials for '{uname}'."
+            ) from exc
 
     @application.post("/api/auth/register", status_code=201, tags=["auth"])
     def register(payload: RegisterRequest, request: Request) -> dict[str, Any]:
@@ -958,10 +1030,14 @@ def create_app(
     def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
         client_ip = request.client.host if request.client else "127.0.0.1"
         _check_rate_limit(client_ip)
+        uname = payload.username.strip().casefold()
+        _check_account_lockout(uname)
         try:
-            user, token = store.authenticate_user(payload.username, payload.password)
+            user, token = store.authenticate_user(uname, payload.password)
+            _clear_failed_attempts(uname)
             return {"user": user, "token": token}
         except ValueError as exc:
+            _record_failed_attempt(uname)
             raise HTTPException(status_code=401, detail=str(exc)) from exc
 
     @application.post("/api/auth/logout", tags=["auth"])
@@ -1122,11 +1198,14 @@ def create_app(
         role: str | None = Query(default=None),
     ):
         user = _require_user(authorization)
-        raw_name = (learner_name or user.get("full_name") or user.get("username") or "Engineering Practitioner").strip()
-        clean_name = re.sub(r"[^A-Za-z0-9 .\-_]", "", raw_name)[:60].strip() or "Practitioner"
+        if not user.get("quiz_passed"):
+            raise HTTPException(status_code=403, detail="Readiness Quiz must be completed and passed before certificate generation.")
+
+        raw_name = (user.get("full_name") or user.get("username") or learner_name or "Engineering Practitioner").strip()
+        clean_name = re.sub(r"[^A-Za-z0-9 .\-_]", "", raw_name)[:50].strip() or "Practitioner"
         safe_filename = clean_name.replace(" ", "_")
 
-        user_role = role or (user.get("role") if user else None) or "Software Developer"
+        user_role = (user.get("role") or role or "software-developer")
         role_display = {
             "software-developer": "Software Developer & Systems Specialist",
             "cloud-engineer": "Cloud Engineer & SRE Specialist",
@@ -1139,8 +1218,10 @@ def create_app(
         cert_id = f"PX-CERT-{(user.get('user_id') if user else 'DEMO')[:8].upper()}"
         today_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
-        assets_dir = PROJECT_ROOT / "frontend" / "assets"
-        cert_path = assets_dir / f"Praxis_Certificate_{cert_id}.pdf"
+        import tempfile
+        temp_dir = Path(tempfile.gettempdir()) / "praxis_certs"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        cert_path = temp_dir / f"Praxis_Certificate_{cert_id}.pdf"
         generate_certificate_pdf(cert_path, clean_name, role_display, cert_id, today_str)
 
         return FileResponse(
@@ -1173,6 +1254,13 @@ def create_app(
     ) -> dict[str, Any]:
         user = _require_user(authorization)
         user_answers = payload.answers
+        if len(user_answers) != 5:
+            raise HTTPException(status_code=422, detail="Readiness assessment requires exactly 5 answer submissions.")
+
+        valid_ids = {q["id"] for q in QUIZ_QUESTIONS}
+        if not all(qid in valid_ids for qid in user_answers.keys()):
+            raise HTTPException(status_code=422, detail="Invalid question ID in quiz submission.")
+
         results = []
         score = 0
         quiz_map = {q["id"]: q for q in QUIZ_QUESTIONS}
@@ -1194,7 +1282,7 @@ def create_app(
                 "explanation": q["explanation"],
             })
 
-        total = max(len(results), 5)
+        total = 5
         passed = (score >= 4)
         store.update_user_quiz(user["user_id"], passed=passed, score=score)
 
@@ -1359,7 +1447,11 @@ def create_app(
         return response
 
     @application.post("/api/submissions", status_code=201, tags=["submissions"])
-    def create_submission(payload: SubmissionRequest) -> dict[str, Any]:
+    def create_submission(
+        payload: SubmissionRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = _require_user(authorization)
         mission = catalog.get_mission(payload.mission_id)
         if mission is None:
             raise HTTPException(status_code=404, detail=f"Mission '{payload.mission_id}' was not found")
@@ -1395,6 +1487,7 @@ def create_app(
         created_at = _now_utc()
         result = {
             "submission_id": submission_id,
+            "user_id": user["user_id"],
             "mission_id": payload.mission_id,
             "answers": payload.answers,
             "score": evaluation["overall_score"],
@@ -1413,16 +1506,29 @@ def create_app(
         return result
 
     @application.get("/api/submissions", tags=["submissions"])
-    def list_submissions(limit: int = 50, mission_id: str | None = None) -> list[dict[str, Any]]:
-        return store.list_all(limit=limit, mission_id=mission_id)
+    def list_submissions(
+        limit: int = 50,
+        mission_id: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> list[dict[str, Any]]:
+        user = _require_user(authorization)
+        if user.get("is_admin"):
+            return store.list_all(limit=limit, mission_id=mission_id)
+        return store.list_by_user(user["user_id"], limit=limit, mission_id=mission_id)
 
     @application.get("/api/submissions/{submission_id}", tags=["submissions"])
-    def get_submission(submission_id: str) -> dict[str, Any]:
+    def get_submission(
+        submission_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = _require_user(authorization)
         if not re.fullmatch(r"^[A-Za-z0-9-]{1,64}$", submission_id):
             raise HTTPException(status_code=400, detail="Invalid submission ID format")
         submission = store.get(submission_id)
         if submission is None:
             raise HTTPException(status_code=404, detail=f"Submission '{submission_id}' was not found")
+        if not user.get("is_admin") and submission.get("user_id") != user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied. You do not own this submission.")
         return submission
 
     @application.patch("/api/submissions/{submission_id}/review", tags=["submissions"])

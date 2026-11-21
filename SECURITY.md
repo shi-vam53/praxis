@@ -1,30 +1,37 @@
 # Security Policy & Hardening
 
-Praxis treats platform security, candidate data integrity, and API key protection with high diligence.
+Praxis enforces platform security, candidate data integrity, and API protection through defense-in-depth engineering.
 
 ---
 
 ## 🛡️ Security Architecture Highlights
 
-1. **Zero Secret Leakage in Client Code**:
-   - Client-side code (`frontend/app.js` and `docs/app.js`) contains **no backend API keys**, service credentials, or sensitive tokens.
-   - LLM evaluations, credential checks, and database updates proxy through protected backend endpoints (`/api/problems/*`).
-2. **Environment Variable Decoupling**:
-   - Backend API keys (`GROQ_API_KEY`, `SUPABASE_KEY`) are loaded dynamically from environment variables or a local `.env` file excluded via `.gitignore`.
-3. **HTTP Hardening Headers**:
-   Every response from the FastAPI server includes strict modern security headers:
+1. **Server-Side Authentication & Session Life Cycle**:
+   - Access to administrative routes (`/api/admin/*`), user exports, and submission reviews is strictly gated by server-side bearer token authentication (`_require_user` and `is_admin == True`).
+   - Admin access is determined exclusively by the database record, not client-side username checks.
+   - Session tokens are generated using `secrets.token_hex(24)` and have explicit expiration dates (`expires_at`).
+2. **Credential & Secret Protection**:
+   - Passwords are encrypted using PBKDF2-HMAC-SHA256 (100,000 iterations) with unique per-user 16-byte random salts.
+   - Password hashes are stored solely in the private backend database and are strictly excluded from any external database synchronizations.
+   - Environment variables decouple all runtime secrets (`GITHUB_TOKEN`, `GROQ_API_KEY`, `ADMIN_INITIAL_PASSWORD`).
+3. **Assessment & Credential Integrity**:
+   - Readiness assessments require exact submission validation against server-side question pools.
+   - Completion certificates are gated behind verified quiz pass status and generated ephemerally, ignoring client-tampered query parameters.
+4. **Brute-Force & Abuse Mitigation**:
+   - Rate limiting and automated account lockout enforce protection against credential stuffing on authentication endpoints.
+   - Submission inputs enforce bounded recursion depths to prevent Denial of Service (`RecursionError`).
+5. **HTTP & Transport Hardening**:
+   Every response includes modern security headers:
    - `X-Content-Type-Options: nosniff`
    - `X-Frame-Options: SAMEORIGIN`
    - `Referrer-Policy: strict-origin-when-cross-origin`
-   - `X-XSS-Protection: 1; mode=block`
    - `Permissions-Policy: geolocation=(), microphone=(), camera=()`
    - `Strict-Transport-Security: max-age=31536000; includeSubDomains`
-4. **Injection Protection**:
+   - `Content-Security-Policy: default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none';`
+   - Scoped CORS origins limiting API access to authorized deployment domains.
+6. **Injection Protection**:
    - All database queries use SQLite parameterized query bindings (`?`), eliminating SQL injection.
-   - User inputs and submission texts are strictly sanitized with HTML escaping before rendering in the DOM.
-5. **Airtight Admin Gating**:
-   - Access to the Governance & Reviewer Leaderboard is restricted to verified administrator `shivam`.
-   - Unauthorized attempts receive `401 Unauthorized` and render an access-restricted lock gate.
+   - User inputs and submission texts are strictly sanitized before rendering in the DOM.
 
 ---
 

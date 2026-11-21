@@ -12,6 +12,9 @@
 *.db
 worksim.sqlite3
 registered_users_ledger.csv
+backend/registered_users_ledger.csv
+frontend/assets/Praxis_Certificate_*.pdf
+docs/assets/Praxis_Certificate_*.pdf
 
 # Python caches & build artifacts
 __pycache__/

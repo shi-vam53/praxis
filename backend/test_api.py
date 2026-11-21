@@ -107,9 +107,17 @@ def test_mission_list_filters_and_full_mission_detail(client):
     assert client.get("/api/missions/not-a-mission").status_code == 404
 
 
+def _user_headers(client, username="tester_api"):
+    reg = client.post("/api/auth/register", json={"username": username, "password": "password123", "full_name": "API Tester"})
+    token = reg.json().get("token") if reg.status_code == 201 else client.post("/api/auth/login", json={"username": username, "password": "password123"}).json()["token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_submission_validation_scoring_persistence_and_retrieval(client):
+    headers = _user_headers(client, "sub_tester_1")
     incomplete = client.post(
         "/api/submissions",
+        headers=headers,
         json={"mission_id": "cloud-sre-01", "answers": {"incident_timeline": "14:10 UTC release deployed"}},
     )
     assert incomplete.status_code == 422
@@ -118,6 +126,7 @@ def test_submission_validation_scoring_persistence_and_retrieval(client):
 
     response = client.post(
         "/api/submissions",
+        headers=headers,
         json={"mission_id": "cloud-sre-01", "answers": _strong_cloud_answers()},
     )
     assert response.status_code == 201
@@ -133,13 +142,13 @@ def test_submission_validation_scoring_persistence_and_retrieval(client):
     assert submission["approval_status"] in {"approved", "conditional", "needs_revision"}
     assert submission["overall_score"] >= 85
 
-    saved = client.get(f"/api/submissions/{submission['submission_id']}")
+    saved = client.get(f"/api/submissions/{submission['submission_id']}", headers=headers)
     assert saved.status_code == 200
     assert saved.json() == submission
-    assert client.get("/api/submissions/unknown-submission").status_code == 404
+    assert client.get("/api/submissions/unknown-submission", headers=headers).status_code == 404
 
     # Test listing historical submissions
-    all_subs = client.get("/api/submissions")
+    all_subs = client.get("/api/submissions", headers=headers)
     assert all_subs.status_code == 200
     assert len(all_subs.json()) >= 1
     assert all_subs.json()[0]["submission_id"] == submission["submission_id"]
@@ -158,10 +167,12 @@ def test_submission_validation_scoring_persistence_and_retrieval(client):
 
 
 def test_submission_rejects_empty_required_answer_and_unknown_mission(client):
+    headers = _user_headers(client, "sub_tester_2")
     answers = _strong_cloud_answers()
     answers["hypothesis"] = "   "
     response = client.post(
         "/api/submissions",
+        headers=headers,
         json={"mission_id": "cloud-sre-01", "answers": answers},
     )
     assert response.status_code == 422
@@ -169,12 +180,14 @@ def test_submission_rejects_empty_required_answer_and_unknown_mission(client):
 
     unknown = client.post(
         "/api/submissions",
+        headers=headers,
         json={"mission_id": "missing", "answers": {"answer": "text"}},
     )
     assert unknown.status_code == 404
 
 
 def test_non_cloud_mission_rubrics_are_evaluated(client):
+    headers = _user_headers(client, "sub_tester_3")
     swe_answers = {
         "bug_analysis": (
             "Stripe retried duplicate webhook evt_109283 after timeout. The findByStripeEventId pre-check "
@@ -192,7 +205,7 @@ def test_non_cloud_mission_rubrics_are_evaluated(client):
             "reviewed refunds with an audit log; do not mass refund."
         ),
     }
-    swe = client.post("/api/submissions", json={"mission_id": "swe-01", "answers": swe_answers})
+    swe = client.post("/api/submissions", headers=headers, json={"mission_id": "swe-01", "answers": swe_answers})
     assert swe.status_code == 201
     assert len(swe.json()["dimensions"]) == 4
     assert swe.json()["overall_score"] >= 85
@@ -214,6 +227,7 @@ def test_non_cloud_mission_rubrics_are_evaluated(client):
     }
     analyst = client.post(
         "/api/submissions",
+        headers=headers,
         json={"mission_id": "data-analyst-01", "answers": analyst_answers},
     )
     assert analyst.status_code == 201
