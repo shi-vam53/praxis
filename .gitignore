@@ -35,3 +35,4 @@ Thumbs.db
 node_modules/
 *.log
 git_push_auto.sh
+create_security_prs.py
