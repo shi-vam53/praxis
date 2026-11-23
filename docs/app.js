@@ -3008,9 +3008,7 @@ function renderCatalogView() {
 
 function isAdminUser() {
   if (!state.user) return false;
-  if (state.user.is_admin === true) return true;
-  const uname = (state.user.username || '').toLowerCase().trim();
-  return uname === 'shivam';
+  return Boolean(state.user.is_admin === true);
 }
 
 function updateAdminNavBadge() {
@@ -3082,12 +3080,12 @@ function bindAdminControls() {
 
       if (errEl) errEl.style.display = 'none';
 
-      if (username !== 'shivam' || password !== 'shivam') {
+      if (!username || !password) {
         if (errEl) {
-          errEl.textContent = 'Access Denied: Invalid administrator credentials. Only authorized user "shivam" with password "shivam" can access the Admin Panel.';
+          errEl.textContent = 'Please enter both administrator username and password.';
           errEl.style.display = 'block';
         }
-        showToast('🔒 Access denied. Invalid administrator credentials.', 'error');
+        showToast('Please enter both administrator username and password.', 'error');
         return;
       }
 
@@ -3097,48 +3095,37 @@ function bindAdminControls() {
       }
 
       try {
-        let verified = false;
-        let adminUser = null;
-        let adminToken = null;
-
-        try {
-          const res = await fetch('/api/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: 'shivam', password: 'shivam' })
-          });
-          if (res.ok) {
-            const data = await res.json();
-            if (data && data.user) {
-              verified = true;
-              adminUser = data.user;
-              adminToken = data.token;
-            }
+        const res = await fetch('/api/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username, password: password })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.user) {
+            const adminUser = data.user;
+            const adminToken = data.token;
+            adminUser.is_admin = true;
+            saveSessionAndProceed(adminUser, adminToken);
+            showToast('👑 Administrator access granted.', 'success');
+            updateAdminNavBadge();
+            renderAdminView();
+            return;
           }
-        } catch (netErr) {}
-
-        if (!verified) {
-          adminUser = {
-            user_id: 'usr_admin_shivam',
-            username: 'shivam',
-            full_name: 'shivam',
-            role: 'cloud-sre',
-            role_locked: true,
-            quiz_passed: true,
-            quiz_score: 100,
-            solved_count: 40,
-            is_admin: true,
-            created_at: new Date().toISOString()
-          };
-          adminToken = 'praxis-admin-token-shivam';
         }
-
-        adminUser.is_admin = true;
-        adminUser.password = 'shivam';
-        saveSessionAndProceed(adminUser, adminToken);
-        showToast('👑 Administrator access granted. Welcome, shivam!', 'success');
-        updateAdminNavBadge();
-        renderAdminView();
+        const errData = await res.json().catch(() => ({}));
+        const errMsg = errData.detail || 'Access Denied: Invalid administrator credentials.';
+        if (errEl) {
+          errEl.textContent = errMsg;
+          errEl.style.display = 'block';
+        }
+        showToast(errMsg, 'error');
+      } catch (netErr) {
+        if (errEl) {
+          errEl.textContent = 'Network error: could not connect to authentication server.';
+          errEl.style.display = 'block';
+        }
+        showToast('Network error while authenticating.', 'error');
       } finally {
         if (submitBtn) {
           submitBtn.disabled = false;
@@ -3421,39 +3408,32 @@ async function submitReviewerDecision(status) {
   const notesEl = document.getElementById('reviewer-notes-input');
   const notes = notesEl ? notesEl.value.trim() : '';
 
+  const token = state.token || safeStorage.getItem('praxis_auth_token') || '';
+
   try {
     const res = await fetch(`/api/submissions/${sub.submission_id}/review`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
       body: JSON.stringify({ status: status, notes: notes })
     });
-    const contentType = res.headers.get('content-type') || '';
-    if (contentType.includes('application/json') && res.ok) {
+    if (res.ok) {
       showToast(`Review saved: marked as ${status.toUpperCase()}`, 'success');
       closeReviewerModal();
       renderAdminView();
       return;
     }
+    const errData = await res.json().catch(() => ({}));
+    const errMsg = errData.detail || 'Failed to submit review. Administrator authorization required.';
+    showToast(errMsg, 'error');
+    return;
   } catch (err) {
-    console.warn('Reviewer patch fallback:', err);
+    console.warn('Reviewer patch network error:', err);
+    showToast('Network error while saving review.', 'error');
+    return;
   }
-
-  // Local update fallback
-  sub.reviewer_status = status;
-  sub.reviewer_notes = notes;
-  try {
-    const offlineSubs = JSON.parse(safeStorage.getItem('praxis_offline_submissions') || '[]');
-    const match = offlineSubs.find(s => s.submission_id === sub.submission_id);
-    if (match) {
-      match.reviewer_status = status;
-      match.reviewer_notes = notes;
-      safeStorage.setItem('praxis_offline_submissions', JSON.stringify(offlineSubs));
-    }
-  } catch (e) {}
-
-  showToast(`Updated reviewer status locally to ${status.toUpperCase()}`, 'info');
-  closeReviewerModal();
-  renderAdminView();
 }
 
 // ============================================================================

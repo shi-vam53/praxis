@@ -205,6 +205,20 @@ def test_certificate_download_endpoint(client):
         json={"role": "cloud-engineer"},
     )
 
+    # Attempting to download certificate without passing quiz -> 403 Forbidden (PRAX-05)
+    unpassed_res = client.get(
+        "/api/certificate/download",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert unpassed_res.status_code == 403
+
+    # Pass the quiz with valid 5 answers
+    client.post(
+        "/api/quiz/submit",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"answers": {"q1": "b", "q2": "b", "q3": "b", "q4": "b", "q5": "b"}},
+    )
+
     res = client.get(
         "/api/certificate/download",
         headers={"Authorization": f"Bearer {token}"},

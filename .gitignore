@@ -12,6 +12,9 @@
 *.db
 worksim.sqlite3
 registered_users_ledger.csv
+backend/registered_users_ledger.csv
+frontend/assets/Praxis_Certificate_*.pdf
+docs/assets/Praxis_Certificate_*.pdf
 
 # Python caches & build artifacts
 __pycache__/
@@ -32,3 +35,4 @@ Thumbs.db
 node_modules/
 *.log
 git_push_auto.sh
+create_security_prs.py
